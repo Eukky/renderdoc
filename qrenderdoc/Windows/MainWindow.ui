@@ -107,6 +107,7 @@
     <addaction name="action_Open_Capture_with_Options"/>
     <addaction name="action_Save_Capture_Inplace"/>
     <addaction name="action_Save_Capture_As"/>
+    <addaction name="action_Export_Project"/>
     <addaction name="action_Close_Capture"/>
     <addaction name="separator"/>
     <addaction name="extension_dummy_File"/>
@@ -446,6 +447,11 @@
   <action name="action_Save_Capture_As">
    <property name="text">
     <string>Sa&amp;ve Capture As</string>
+   </property>
+  </action>
+  <action name="action_Export_Project">
+   <property name="text">
+    <string>Export &amp;Performance Summary</string>
    </property>
   </action>
   <action name="action_Comments">

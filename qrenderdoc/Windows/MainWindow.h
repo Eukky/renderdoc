@@ -154,6 +154,7 @@ private slots:
   void on_action_Open_Capture_with_Options_triggered();
   void on_action_Save_Capture_Inplace_triggered();
   void on_action_Save_Capture_As_triggered();
+  void on_action_Export_Project_triggered();
   void on_action_Close_Capture_triggered();
   void on_action_Mesh_Output_triggered();
   void on_action_API_Inspector_triggered();

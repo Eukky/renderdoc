@@ -23,9 +23,16 @@
  ******************************************************************************/
 
 #include "MainWindow.h"
+#include <algorithm>
+#include <atomic>
+#include <QDateTime>
 #include <QDesktopServices>
+#include <QDir>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QKeyEvent>
 #include <QMimeData>
 #include <QMouseEvent>
@@ -34,7 +41,9 @@
 #include <QPixmapCache>
 #include <QProgressBar>
 #include <QProgressDialog>
+#include <QRegularExpression>
 #include <QShortcut>
+#include <QTextStream>
 #include <QToolButton>
 #include <QToolTip>
 #include "Code/QRDUtils.h"
@@ -61,6 +70,1026 @@
 #if defined(Q_OS_WIN32)
 extern "C" void *__stdcall GetModuleHandleA(const char *);
 #endif
+
+namespace
+{
+static const int ExportPathComponentLength = 48;
+static const int MaxHotspotCount = 50;
+
+struct ExportActionInfo
+{
+  uint32_t actionId = 0;
+  uint32_t eventId = 0;
+  QString name;
+  QString hierarchy;
+  QString kind;
+  QString flagsText;
+  bool fakeMarker = false;
+  ActionFlags flags = ActionFlags::NoFlags;
+  uint32_t numIndices = 0;
+  uint32_t numInstances = 0;
+  int32_t baseVertex = 0;
+  uint32_t indexOffset = 0;
+  uint32_t vertexOffset = 0;
+  uint32_t instanceOffset = 0;
+  uint32_t drawIndex = 0;
+  rdcfixedarray<uint32_t, 3> dispatchDimension = {0, 0, 0};
+  rdcfixedarray<uint32_t, 3> dispatchThreadsDimension = {0, 0, 0};
+  rdcfixedarray<uint32_t, 3> dispatchBase = {0, 0, 0};
+  ResourceId copySource;
+  ResourceId copyDestination;
+  ResourceId depthOut;
+  rdcfixedarray<ResourceId, 8> outputs;
+  QVector<uint32_t> eventIds;
+};
+
+struct ExportActionSummary
+{
+  ExportActionInfo action;
+  double gpuDurationMs = -1.0;
+  int counterValueCount = 0;
+  int performanceMessageCount = 0;
+};
+
+QString SanitiseFileComponent(QString value, int maxLen = ExportPathComponentLength)
+{
+  value = value.simplified();
+  value.replace(QRegularExpression(lit("[\\\\/:*?\"<>|]+")), lit("_"));
+  value.replace(QRegularExpression(lit("\\s+")), lit("_"));
+  value.replace(QRegularExpression(lit("[^A-Za-z0-9._@+-]+")), lit("_"));
+  value.remove(QRegularExpression(lit("^_+")));
+  value.remove(QRegularExpression(lit("_+$")));
+
+  if(value.isEmpty())
+    value = lit("unnamed");
+
+  if(value.size() > maxLen)
+    value = value.left(maxLen);
+
+  return value;
+}
+
+QString ResourceIdText(ResourceId id)
+{
+  return ToQStr(id);
+}
+
+QString FromRDCStr(const rdcstr &value)
+{
+  return QString(value);
+}
+
+QString ActionKind(ActionFlags flags)
+{
+  if(flags & ActionFlags::Drawcall)
+    return lit("Drawcall");
+  if(flags & ActionFlags::MeshDispatch)
+    return lit("MeshDispatch");
+  if(flags & ActionFlags::Dispatch)
+    return lit("Dispatch");
+  if(flags & ActionFlags::DispatchRay)
+    return lit("DispatchRay");
+  if(flags & ActionFlags::Copy)
+    return lit("Copy");
+  if(flags & ActionFlags::Resolve)
+    return lit("Resolve");
+  if(flags & ActionFlags::Clear)
+    return lit("Clear");
+  if(flags & ActionFlags::Present)
+    return lit("Present");
+  if(flags & ActionFlags::PushMarker)
+    return lit("PushMarker");
+  if(flags & ActionFlags::SetMarker)
+    return lit("SetMarker");
+  if(flags & ActionFlags::PopMarker)
+    return lit("PopMarker");
+  if(flags & ActionFlags::CmdList)
+    return lit("CommandBuffer");
+  return lit("Action");
+}
+
+QString DisplayActionName(const ActionDescription &action, const SDFile &structuredFile)
+{
+  QString name = FromRDCStr(action.GetName(structuredFile)).trimmed();
+  if(name.isEmpty())
+    name = QFormatStr("%1_E%2").arg(ActionKind(action.flags)).arg(action.eventId);
+  return name;
+}
+
+QJsonValue ToJsonU64(uint64_t value)
+{
+  return QString::number(value);
+}
+
+QJsonArray ToJsonArray(const QVector<uint32_t> &values)
+{
+  QJsonArray arr;
+  for(uint32_t value : values)
+    arr.append(int(value));
+  return arr;
+}
+
+QJsonArray ToJsonArray(const rdcfixedarray<uint32_t, 3> &values)
+{
+  QJsonArray arr;
+  arr.append(int(values[0]));
+  arr.append(int(values[1]));
+  arr.append(int(values[2]));
+  return arr;
+}
+
+bool WriteTextFile(const QString &path, const QString &contents, QString &error)
+{
+  QFile file(path);
+  if(!file.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text))
+  {
+    error = QFormatStr("Couldn't open '%1' for writing: %2").arg(path).arg(file.errorString());
+    return false;
+  }
+
+  QByteArray data = contents.toUtf8();
+  if(file.write(data) != data.size())
+  {
+    error = QFormatStr("Couldn't write '%1': %2").arg(path).arg(file.errorString());
+    return false;
+  }
+
+  return true;
+}
+
+bool WriteJsonFile(const QString &path, const QJsonObject &json, QString &error)
+{
+  QFile file(path);
+  if(!file.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text))
+  {
+    error = QFormatStr("Couldn't open '%1' for writing: %2").arg(path).arg(file.errorString());
+    return false;
+  }
+
+  QByteArray data = QJsonDocument(json).toJson(QJsonDocument::Indented);
+  if(file.write(data) != data.size())
+  {
+    error = QFormatStr("Couldn't write '%1': %2").arg(path).arg(file.errorString());
+    return false;
+  }
+
+  return true;
+}
+
+QJsonObject MakeDebugMessageJson(const DebugMessage &message)
+{
+  QJsonObject obj;
+  obj[lit("event_id")] = int(message.eventId);
+  obj[lit("category")] = ToQStr(message.category);
+  obj[lit("severity")] = ToQStr(message.severity);
+  obj[lit("source")] = ToQStr(message.source);
+  obj[lit("message_id")] = int(message.messageID);
+  obj[lit("description")] = FromRDCStr(message.description);
+  return obj;
+}
+
+QJsonObject MakeResourceSummaryJson(const QString &label, ResourceId id,
+                                    const QMap<ResourceId, QString> &resourceNames,
+                                    const QMap<ResourceId, ResourceDescription> &resourceDescs,
+                                    const QMap<ResourceId, TextureDescription> &textureDescs,
+                                    const QMap<ResourceId, BufferDescription> &bufferDescs)
+{
+  QJsonObject obj;
+
+  if(id == ResourceId())
+    return obj;
+
+  obj[lit("label")] = label;
+  obj[lit("resource_id")] = ResourceIdText(id);
+
+  QString resourceName = resourceNames.value(id).trimmed();
+  obj[lit("name")] = resourceName.isEmpty() ? ResourceIdText(id) : resourceName;
+
+  auto resIt = resourceDescs.find(id);
+  if(resIt != resourceDescs.end())
+    obj[lit("resource_type")] = ToQStr(resIt.value().type);
+
+  auto texIt = textureDescs.find(id);
+  if(texIt != textureDescs.end())
+  {
+    const TextureDescription &tex = texIt.value();
+    obj[lit("kind")] = lit("texture");
+    obj[lit("texture_type")] = ToQStr(tex.type);
+    obj[lit("dimension")] = int(tex.dimension);
+    obj[lit("width")] = int(tex.width);
+    obj[lit("height")] = int(tex.height);
+    obj[lit("depth")] = int(tex.depth);
+    obj[lit("array_size")] = int(tex.arraysize);
+    obj[lit("mips")] = int(tex.mips);
+    obj[lit("msaa_samples")] = int(tex.msSamp);
+    obj[lit("format")] = FromRDCStr(tex.format.Name());
+    obj[lit("byte_size")] = ToJsonU64(tex.byteSize);
+    obj[lit("creation_flags")] = ToQStr(tex.creationFlags);
+    return obj;
+  }
+
+  auto bufIt = bufferDescs.find(id);
+  if(bufIt != bufferDescs.end())
+  {
+    const BufferDescription &buf = bufIt.value();
+    obj[lit("kind")] = lit("buffer");
+    obj[lit("length")] = ToJsonU64(buf.length);
+    obj[lit("gpu_address")] = ToJsonU64(buf.gpuAddress);
+    obj[lit("creation_flags")] = ToQStr(buf.creationFlags);
+    return obj;
+  }
+
+  obj[lit("kind")] = lit("resource");
+  return obj;
+}
+
+QJsonObject MakeBasicBindStatsJson(uint32_t calls, uint32_t sets, uint32_t nulls)
+{
+  QJsonObject obj;
+  obj[lit("calls")] = int(calls);
+  obj[lit("sets")] = int(sets);
+  obj[lit("nulls")] = int(nulls);
+  return obj;
+}
+
+QJsonObject MakeStateBindStatsJson(uint32_t calls, uint32_t sets, uint32_t nulls,
+                                   uint32_t redundants)
+{
+  QJsonObject obj = MakeBasicBindStatsJson(calls, sets, nulls);
+  obj[lit("redundants")] = int(redundants);
+  return obj;
+}
+
+QJsonObject MakeFrameStatsJson(const FrameStatistics &stats)
+{
+  QJsonObject obj;
+  obj[lit("recorded")] = stats.recorded;
+
+  if(!stats.recorded)
+    return obj;
+
+  QJsonObject draws;
+  draws[lit("calls")] = int(stats.draws.calls);
+  draws[lit("instanced")] = int(stats.draws.instanced);
+  draws[lit("indirect")] = int(stats.draws.indirect);
+  obj[lit("draws")] = draws;
+
+  QJsonObject dispatches;
+  dispatches[lit("calls")] = int(stats.dispatches.calls);
+  dispatches[lit("indirect")] = int(stats.dispatches.indirect);
+  obj[lit("dispatches")] = dispatches;
+
+  QJsonObject updates;
+  updates[lit("calls")] = int(stats.updates.calls);
+  updates[lit("client_writes")] = int(stats.updates.clients);
+  updates[lit("server_writes")] = int(stats.updates.servers);
+  obj[lit("resource_updates")] = updates;
+
+  obj[lit("index_binds")] =
+      MakeBasicBindStatsJson(stats.indices.calls, stats.indices.sets, stats.indices.nulls);
+  obj[lit("vertex_binds")] =
+      MakeBasicBindStatsJson(stats.vertices.calls, stats.vertices.sets, stats.vertices.nulls);
+  obj[lit("layout_binds")] =
+      MakeBasicBindStatsJson(stats.layouts.calls, stats.layouts.sets, stats.layouts.nulls);
+  obj[lit("output_binds")] =
+      MakeBasicBindStatsJson(stats.outputs.calls, stats.outputs.sets, stats.outputs.nulls);
+  obj[lit("blend_state_binds")] = MakeStateBindStatsJson(stats.blends.calls, stats.blends.sets,
+                                                         stats.blends.nulls, stats.blends.redundants);
+  obj[lit("depth_stencil_binds")] = MakeStateBindStatsJson(
+      stats.depths.calls, stats.depths.sets, stats.depths.nulls, stats.depths.redundants);
+  obj[lit("rasterizer_binds")] = MakeStateBindStatsJson(
+      stats.rasters.calls, stats.rasters.sets, stats.rasters.nulls, stats.rasters.redundants);
+
+  return obj;
+}
+
+QJsonObject MakeCounterDescriptionJson(const CounterDescription &desc)
+{
+  QJsonObject obj;
+  obj[lit("counter")] = ToQStr(desc.counter);
+  obj[lit("name")] = FromRDCStr(desc.name);
+  obj[lit("category")] = FromRDCStr(desc.category);
+  obj[lit("description")] = FromRDCStr(desc.description);
+  obj[lit("result_type")] = ToQStr(desc.resultType);
+  obj[lit("result_byte_width")] = int(desc.resultByteWidth);
+  obj[lit("unit")] = ToQStr(desc.unit);
+  return obj;
+}
+
+QJsonValue MakeCounterValueJson(const CounterDescription &desc, const CounterResult &result)
+{
+  if(desc.resultType == CompType::UInt)
+  {
+    if(desc.resultByteWidth <= 4)
+      return QString::number(uint64_t(result.value.u32));
+
+    return QString::number(result.value.u64);
+  }
+
+  if(desc.resultByteWidth <= 4)
+    return result.value.f;
+
+  return result.value.d;
+}
+
+bool IsPerformanceRelevantAction(const ExportActionInfo &action)
+{
+  if(action.fakeMarker || action.eventId == 0)
+    return false;
+
+  return bool(action.flags &
+              (ActionFlags::Drawcall | ActionFlags::Dispatch | ActionFlags::MeshDispatch |
+               ActionFlags::DispatchRay | ActionFlags::Copy | ActionFlags::Resolve |
+               ActionFlags::Clear | ActionFlags::Present));
+}
+
+bool ActionUsesPipelineState(const ExportActionInfo &action)
+{
+  return bool(action.flags &
+              (ActionFlags::Drawcall | ActionFlags::Dispatch | ActionFlags::MeshDispatch |
+               ActionFlags::DispatchRay));
+}
+
+QString FormatMilliseconds(double milliseconds)
+{
+  if(milliseconds < 0.0)
+    return lit("-");
+
+  return QString::number(milliseconds, 'f', 3);
+}
+
+void CollectExportActions(const rdcarray<ActionDescription> &actions, const SDFile &structuredFile,
+                          const QStringList &parents, QVector<ExportActionInfo> &out)
+{
+  for(const ActionDescription &action : actions)
+  {
+    ExportActionInfo info;
+    info.actionId = action.actionId;
+    info.eventId = action.eventId;
+    info.name = DisplayActionName(action, structuredFile);
+    info.hierarchy = parents.join(lit(" / "));
+    info.kind = ActionKind(action.flags);
+    info.flags = action.flags;
+    info.flagsText = ToQStr(action.flags);
+    info.fakeMarker = action.IsFakeMarker();
+    info.numIndices = action.numIndices;
+    info.numInstances = action.numInstances;
+    info.baseVertex = action.baseVertex;
+    info.indexOffset = action.indexOffset;
+    info.vertexOffset = action.vertexOffset;
+    info.instanceOffset = action.instanceOffset;
+    info.drawIndex = action.drawIndex;
+    info.dispatchDimension = action.dispatchDimension;
+    info.dispatchThreadsDimension = action.dispatchThreadsDimension;
+    info.dispatchBase = action.dispatchBase;
+    info.copySource = action.copySource;
+    info.copyDestination = action.copyDestination;
+    info.depthOut = action.depthOut;
+    info.outputs = action.outputs;
+    info.eventIds.reserve(action.events.count());
+
+    for(const APIEvent &event : action.events)
+      info.eventIds.push_back(event.eventId);
+
+    if(info.eventIds.isEmpty() && info.eventId != 0)
+      info.eventIds.push_back(info.eventId);
+
+    out.push_back(info);
+
+    QStringList childParents = parents;
+    if(!action.children.empty())
+      childParents.push_back(info.name);
+
+    CollectExportActions(action.children, structuredFile, childParents, out);
+  }
+}
+}    // namespace
+
+static void ExportPerformanceSummary(MainWindow *window, ICaptureContext &ctx,
+                                     const QString &outputRoot)
+{
+  QString exportTimestamp = QDateTime::currentDateTime().toString(Qt::ISODate);
+  const FrameDescription &frameInfo = ctx.FrameInfo();
+  const FrameStatistics frameStats = frameInfo.stats;
+  uint32_t frameNumber = frameInfo.frameNumber;
+  bool hasFrameNumber = frameNumber != FrameDescription::NoFrameNumber;
+  QString captureFilename = ctx.GetCaptureFilename();
+  QString driverName = FromRDCStr(ctx.Replay().GetCaptureAccess()->DriverName());
+  GraphicsAPI apiType = ctx.APIProps().pipelineType;
+  QString apiName = ToQStr(apiType);
+  QJsonObject frameStatsJson = MakeFrameStatsJson(frameStats);
+
+  QMap<ResourceId, ResourceDescription> resourceDescs;
+  QMap<ResourceId, TextureDescription> textureDescs;
+  QMap<ResourceId, BufferDescription> bufferDescs;
+  QMap<ResourceId, QString> resourceNames;
+
+  for(const ResourceDescription &resource : ctx.GetResources())
+  {
+    ResourceDescription copy = resource;
+    copy.annotations = NULL;
+    resourceDescs.insert(copy.resourceId, copy);
+    resourceNames.insert(copy.resourceId, ctx.GetResourceName(copy.resourceId));
+  }
+
+  for(const TextureDescription &texture : ctx.GetTextures())
+    textureDescs.insert(texture.resourceId, texture);
+
+  for(const BufferDescription &buffer : ctx.GetBuffers())
+    bufferDescs.insert(buffer.resourceId, buffer);
+
+  QVector<ExportActionInfo> allActions;
+  CollectExportActions(ctx.CurRootActions(), ctx.GetStructuredFile(), {}, allActions);
+
+  QVector<ExportActionInfo> actions;
+  actions.reserve(allActions.count());
+  for(const ExportActionInfo &action : allActions)
+  {
+    if(IsPerformanceRelevantAction(action))
+      actions.push_back(action);
+  }
+
+  const int filteredOutActionCount = allActions.count() - actions.count();
+
+  QVector<DebugMessage> frameLevelPerformanceMessages;
+  QJsonArray performanceMessagesJson;
+  QMap<uint32_t, int> performanceMessageCountByEvent;
+  int totalPerformanceMessageCount = 0;
+
+  for(const DebugMessage &message : ctx.DebugMessages())
+  {
+    if(message.category != MessageCategory::Performance)
+      continue;
+
+    performanceMessagesJson.append(MakeDebugMessageJson(message));
+    performanceMessageCountByEvent[message.eventId] =
+        performanceMessageCountByEvent.value(message.eventId) + 1;
+
+    if(message.eventId == 0)
+      frameLevelPerformanceMessages.push_back(message);
+
+    totalPerformanceMessageCount++;
+  }
+
+  const QVector<GPUCounter> desiredCounters = {
+      GPUCounter::EventGPUDuration,      GPUCounter::InputVerticesRead,
+      GPUCounter::IAPrimitives,          GPUCounter::GSPrimitives,
+      GPUCounter::RasterizerInvocations, GPUCounter::RasterizedPrimitives,
+      GPUCounter::SamplesPassed,         GPUCounter::VSInvocations,
+      GPUCounter::HSInvocations,         GPUCounter::DSInvocations,
+      GPUCounter::GSInvocations,         GPUCounter::PSInvocations,
+      GPUCounter::CSInvocations,         GPUCounter::ASInvocations,
+      GPUCounter::MSInvocations,
+  };
+
+  QJsonArray requestedCounterNamesJson;
+  for(GPUCounter counter : desiredCounters)
+    requestedCounterNamesJson.append(ToQStr(counter));
+
+  uint32_t originalSelectedEvent = ctx.CurSelectedEvent();
+  uint32_t originalEvent = ctx.CurEvent();
+
+  std::atomic<bool> finished(false);
+  std::atomic<float> progress(0.0f);
+  std::atomic<bool> cancelRequested(false);
+  bool cancelledByUser = false;
+  QString fatalError;
+  QJsonArray actionDocs;
+  QJsonArray hotspotDocs;
+  QJsonArray selectedCounterDescriptionsJson;
+  QJsonArray missingCounterNamesJson;
+  int actionsWithCounterData = 0;
+  int actionsWithGpuDuration = 0;
+  int actionsWithPerformanceMessages = 0;
+  QVector<ExportActionSummary> actionSummaries;
+
+  LambdaThread *exportThread = new LambdaThread(
+      [&ctx, outputRoot, exportTimestamp, captureFilename, driverName, apiName, apiType,
+       frameNumber, hasFrameNumber, frameStatsJson, actions, filteredOutActionCount,
+       desiredCounters, requestedCounterNamesJson, performanceMessagesJson,
+       frameLevelPerformanceMessages, performanceMessageCountByEvent, totalPerformanceMessageCount,
+       resourceDescs, textureDescs, bufferDescs, resourceNames, &finished, &progress,
+       &cancelRequested, &cancelledByUser, &fatalError, &actionDocs, &hotspotDocs,
+       &selectedCounterDescriptionsJson, &missingCounterNamesJson, &actionsWithCounterData,
+       &actionsWithGpuDuration, &actionsWithPerformanceMessages, &actionSummaries]() mutable {
+        auto finish = [&]() { finished.store(true); };
+        auto setProgress = [&](int completed, int total) {
+          progress.store(total > 0 ? float(completed) / float(total) : 1.0f);
+        };
+
+        int totalSteps = qMax(1, actions.count() + 2);
+        int completedSteps = 0;
+
+        QDir rootDir(outputRoot);
+
+        if(!QDir().mkpath(rootDir.absolutePath()))
+        {
+          fatalError = QFormatStr("Couldn't create export directory '%1'.").arg(outputRoot);
+          finish();
+          return;
+        }
+
+        completedSteps++;
+        setProgress(completedSteps, totalSteps);
+
+        QMap<uint32_t, CounterDescription> counterDescriptionsById;
+        QMap<uint32_t, QMap<uint32_t, QJsonValue>> counterValuesByEvent;
+        QMap<uint32_t, double> gpuDurationMsByEvent;
+
+        ctx.Replay().BlockInvoke([&](IReplayController *r) {
+          if(cancelRequested.load())
+          {
+            cancelledByUser = true;
+            return;
+          }
+
+          rdcarray<GPUCounter> availableCounters = r->EnumerateCounters();
+
+          auto counterAvailable = [&](GPUCounter target) {
+            for(GPUCounter available : availableCounters)
+            {
+              if(available == target)
+                return true;
+            }
+
+            return false;
+          };
+
+          QVector<GPUCounter> selectedCounters;
+          selectedCounters.reserve(desiredCounters.count());
+
+          for(GPUCounter counter : desiredCounters)
+          {
+            if(counterAvailable(counter))
+              selectedCounters.push_back(counter);
+            else
+              missingCounterNamesJson.append(ToQStr(counter));
+          }
+
+          for(GPUCounter counter : selectedCounters)
+          {
+            CounterDescription desc = r->DescribeCounter(counter);
+            counterDescriptionsById[uint32_t(counter)] = desc;
+            selectedCounterDescriptionsJson.append(MakeCounterDescriptionJson(desc));
+          }
+
+          if(!selectedCounters.isEmpty())
+          {
+            rdcarray<GPUCounter> fetchCounters;
+            fetchCounters.resize(selectedCounters.count());
+
+            for(int i = 0; i < selectedCounters.count(); i++)
+              fetchCounters[i] = selectedCounters[i];
+
+            rdcarray<CounterResult> results = r->FetchCounters(fetchCounters);
+
+            for(const CounterResult &result : results)
+            {
+              uint32_t counterId = uint32_t(result.counter);
+
+              if(!counterDescriptionsById.contains(counterId))
+                continue;
+
+              const CounterDescription &desc = counterDescriptionsById[counterId];
+
+              if(desc.counter == GPUCounter::EventGPUDuration)
+              {
+                double durationSeconds =
+                    desc.resultByteWidth <= 4 ? double(result.value.f) : result.value.d;
+
+                if(durationSeconds >= 0.0)
+                  gpuDurationMsByEvent[result.eventId] = durationSeconds * 1000.0;
+                else
+                  continue;
+              }
+
+              counterValuesByEvent[result.eventId][counterId] = MakeCounterValueJson(desc, result);
+            }
+          }
+
+          completedSteps++;
+          setProgress(completedSteps, totalSteps);
+
+          for(const ExportActionInfo &action : actions)
+          {
+            if(cancelRequested.load())
+            {
+              cancelledByUser = true;
+              return;
+            }
+
+            QJsonObject actionDoc;
+            actionDoc[lit("action_id")] = int(action.actionId);
+            actionDoc[lit("event_id")] = int(action.eventId);
+            actionDoc[lit("name")] = action.name;
+            actionDoc[lit("hierarchy")] =
+                action.hierarchy.isEmpty() ? lit("<root>") : action.hierarchy;
+            actionDoc[lit("kind")] = action.kind;
+            actionDoc[lit("flags")] = action.flagsText;
+            actionDoc[lit("event_ids")] = ToJsonArray(action.eventIds);
+
+            if(action.flags & (ActionFlags::Drawcall | ActionFlags::MeshDispatch))
+            {
+              actionDoc[lit("num_indices")] = int(action.numIndices);
+              actionDoc[lit("num_instances")] = int(action.numInstances);
+              actionDoc[lit("base_vertex")] = action.baseVertex;
+              actionDoc[lit("index_offset")] = int(action.indexOffset);
+              actionDoc[lit("vertex_offset")] = int(action.vertexOffset);
+              actionDoc[lit("instance_offset")] = int(action.instanceOffset);
+              actionDoc[lit("draw_index")] = int(action.drawIndex);
+            }
+
+            if(action.flags &
+               (ActionFlags::Dispatch | ActionFlags::MeshDispatch | ActionFlags::DispatchRay))
+            {
+              actionDoc[lit("dispatch_dimension")] = ToJsonArray(action.dispatchDimension);
+              actionDoc[lit("dispatch_threads_dimension")] =
+                  ToJsonArray(action.dispatchThreadsDimension);
+              actionDoc[lit("dispatch_base")] = ToJsonArray(action.dispatchBase);
+            }
+
+            const QMap<uint32_t, QJsonValue> eventCounterValues =
+                counterValuesByEvent.value(action.eventId);
+            QJsonObject counterValuesJson;
+
+            for(auto it = eventCounterValues.begin(); it != eventCounterValues.end(); ++it)
+            {
+              if(!counterDescriptionsById.contains(it.key()))
+                continue;
+
+              const CounterDescription &desc = counterDescriptionsById[it.key()];
+              counterValuesJson[ToQStr(desc.counter)] = it.value();
+            }
+
+            const int counterValueCount = eventCounterValues.size();
+            if(!counterValuesJson.isEmpty())
+            {
+              actionDoc[lit("counters")] = counterValuesJson;
+              actionsWithCounterData++;
+            }
+
+            double gpuDurationMs = -1.0;
+            if(gpuDurationMsByEvent.contains(action.eventId))
+            {
+              gpuDurationMs = gpuDurationMsByEvent[action.eventId];
+              actionDoc[lit("gpu_duration_ms")] = gpuDurationMs;
+              actionsWithGpuDuration++;
+            }
+
+            int performanceMessageCount = 0;
+            for(uint32_t eventId : action.eventIds)
+              performanceMessageCount += performanceMessageCountByEvent.value(eventId);
+
+            actionDoc[lit("performance_message_count")] = performanceMessageCount;
+            if(performanceMessageCount > 0)
+              actionsWithPerformanceMessages++;
+
+            QJsonArray relatedResourcesJson;
+
+            auto appendResource = [&](const QString &label, ResourceId id) {
+              QJsonObject resourceJson = MakeResourceSummaryJson(
+                  label, id, resourceNames, resourceDescs, textureDescs, bufferDescs);
+              if(!resourceJson.isEmpty())
+                relatedResourcesJson.append(resourceJson);
+            };
+
+            appendResource(lit("copy_source"), action.copySource);
+            appendResource(lit("copy_destination"), action.copyDestination);
+            appendResource(lit("depth_output"), action.depthOut);
+
+            for(size_t i = 0; i < action.outputs.size(); i++)
+            {
+              if(action.outputs[i] != ResourceId())
+                appendResource(QFormatStr("color_output_%1").arg(int(i)), action.outputs[i]);
+            }
+
+            if(!relatedResourcesJson.isEmpty())
+              actionDoc[lit("related_resources")] = relatedResourcesJson;
+
+            if(ActionUsesPipelineState(action))
+            {
+              r->SetFrameEvent(action.eventId, false);
+              const PipeState &pipe = r->GetPipelineState();
+
+              ResourceId graphicsPipeline = pipe.GetGraphicsPipelineObject();
+              ResourceId computePipeline = pipe.GetComputePipelineObject();
+
+              if(graphicsPipeline != ResourceId())
+              {
+                actionDoc[lit("graphics_pipeline_object")] = ResourceIdText(graphicsPipeline);
+
+                QString pipelineName = resourceNames.value(graphicsPipeline).trimmed();
+                if(!pipelineName.isEmpty())
+                  actionDoc[lit("graphics_pipeline_name")] = pipelineName;
+              }
+
+              if(computePipeline != ResourceId())
+              {
+                actionDoc[lit("compute_pipeline_object")] = ResourceIdText(computePipeline);
+
+                QString pipelineName = resourceNames.value(computePipeline).trimmed();
+                if(!pipelineName.isEmpty())
+                  actionDoc[lit("compute_pipeline_name")] = pipelineName;
+              }
+
+              QJsonArray shaderBindingsJson;
+              QJsonArray bindingCountsJson;
+
+              for(ShaderStage stage : {ShaderStage::Vertex, ShaderStage::Hull,
+                                       ShaderStage::Domain, ShaderStage::Geometry,
+                                       ShaderStage::Pixel, ShaderStage::Compute,
+                                       ShaderStage::Task, ShaderStage::Mesh})
+              {
+                QString stageName = ToQStr(stage, apiType);
+                ResourceId shaderId = pipe.GetShader(stage);
+                int constantCount = pipe.GetConstantBlocks(stage, true).count();
+                int readOnlyCount = pipe.GetReadOnlyResources(stage, true).count();
+                int readWriteCount = pipe.GetReadWriteResources(stage, true).count();
+                int samplerCount = pipe.GetSamplers(stage, true).count();
+
+                if(shaderId == ResourceId() && constantCount == 0 && readOnlyCount == 0 &&
+                   readWriteCount == 0 && samplerCount == 0)
+                {
+                  continue;
+                }
+
+                if(shaderId != ResourceId())
+                {
+                  QJsonObject shaderJson;
+                  shaderJson[lit("stage")] = stageName;
+                  shaderJson[lit("resource_id")] = ResourceIdText(shaderId);
+
+                  QString shaderName = resourceNames.value(shaderId).trimmed();
+                  shaderJson[lit("name")] =
+                      shaderName.isEmpty() ? ResourceIdText(shaderId) : shaderName;
+                  shaderBindingsJson.append(shaderJson);
+                }
+
+                QJsonObject bindingJson;
+                bindingJson[lit("stage")] = stageName;
+                bindingJson[lit("constant_buffers")] = constantCount;
+                bindingJson[lit("read_only_resources")] = readOnlyCount;
+                bindingJson[lit("read_write_resources")] = readWriteCount;
+                bindingJson[lit("samplers")] = samplerCount;
+                bindingCountsJson.append(bindingJson);
+              }
+
+              if(!shaderBindingsJson.isEmpty())
+                actionDoc[lit("shader_bindings")] = shaderBindingsJson;
+              if(!bindingCountsJson.isEmpty())
+                actionDoc[lit("binding_counts")] = bindingCountsJson;
+            }
+
+            actionDocs.append(actionDoc);
+
+            ExportActionSummary summary;
+            summary.action = action;
+            summary.gpuDurationMs = gpuDurationMs;
+            summary.counterValueCount = counterValueCount;
+            summary.performanceMessageCount = performanceMessageCount;
+            actionSummaries.push_back(summary);
+
+            completedSteps++;
+            setProgress(completedSteps, totalSteps);
+          }
+        });
+
+        auto hotspotSort = [](const ExportActionSummary &a, const ExportActionSummary &b) {
+          const bool aHasDuration = a.gpuDurationMs >= 0.0;
+          const bool bHasDuration = b.gpuDurationMs >= 0.0;
+
+          if(aHasDuration != bHasDuration)
+            return aHasDuration > bHasDuration;
+
+          if(aHasDuration && a.gpuDurationMs != b.gpuDurationMs)
+            return a.gpuDurationMs > b.gpuDurationMs;
+
+          if(a.performanceMessageCount != b.performanceMessageCount)
+            return a.performanceMessageCount > b.performanceMessageCount;
+
+          return a.action.eventId < b.action.eventId;
+        };
+
+        QVector<ExportActionSummary> hotspotSummaries = actionSummaries;
+        std::sort(hotspotSummaries.begin(), hotspotSummaries.end(), hotspotSort);
+
+        for(const ExportActionSummary &summary : hotspotSummaries)
+        {
+          if(summary.gpuDurationMs < 0.0)
+            continue;
+
+          QJsonObject hotspot;
+          hotspot[lit("action_id")] = int(summary.action.actionId);
+          hotspot[lit("event_id")] = int(summary.action.eventId);
+          hotspot[lit("name")] = summary.action.name;
+          hotspot[lit("kind")] = summary.action.kind;
+          hotspot[lit("hierarchy")] =
+              summary.action.hierarchy.isEmpty() ? lit("<root>") : summary.action.hierarchy;
+          hotspot[lit("gpu_duration_ms")] = summary.gpuDurationMs;
+          hotspot[lit("performance_message_count")] = summary.performanceMessageCount;
+          hotspotDocs.append(hotspot);
+
+          if(hotspotDocs.count() >= MaxHotspotCount)
+            break;
+        }
+
+        if(fatalError.isEmpty())
+        {
+          QJsonObject manifest;
+          manifest[lit("export_type")] = lit("performance_summary");
+          manifest[lit("capture_file")] = captureFilename;
+          manifest[lit("driver")] = driverName;
+          manifest[lit("graphics_api")] = apiName;
+          manifest[lit("generated_at")] = exportTimestamp;
+          manifest[lit("status")] = cancelledByUser ? lit("cancelled") : lit("completed");
+          if(hasFrameNumber)
+            manifest[lit("frame_number")] = int(frameNumber);
+          manifest[lit("frame_stats_recorded")] = frameStatsJson[lit("recorded")].toBool();
+          manifest[lit("total_relevant_actions")] = actions.count();
+          manifest[lit("exported_action_count")] = actionDocs.count();
+          manifest[lit("filtered_out_action_count")] = filteredOutActionCount;
+          manifest[lit("captured_counter_count")] = selectedCounterDescriptionsJson.count();
+          manifest[lit("missing_counter_count")] = missingCounterNamesJson.count();
+          manifest[lit("actions_with_counter_data")] = actionsWithCounterData;
+          manifest[lit("actions_with_gpu_duration")] = actionsWithGpuDuration;
+          manifest[lit("actions_with_performance_messages")] = actionsWithPerformanceMessages;
+          manifest[lit("performance_message_count")] = totalPerformanceMessageCount;
+          manifest[lit("frame_level_performance_message_count")] =
+              frameLevelPerformanceMessages.count();
+
+          QJsonObject files;
+          files[lit("frame_stats")] = lit("frame_stats.json");
+          files[lit("counters")] = lit("counters.json");
+          files[lit("actions")] = lit("actions.json");
+          files[lit("hotspots")] = lit("hotspots.json");
+          files[lit("performance_messages")] = lit("performance_messages.json");
+          files[lit("index")] = lit("index.md");
+          manifest[lit("files")] = files;
+
+          QJsonObject countersDoc;
+          countersDoc[lit("requested_generic_counters")] = requestedCounterNamesJson;
+          countersDoc[lit("captured_counter_count")] = selectedCounterDescriptionsJson.count();
+          countersDoc[lit("missing_counter_count")] = missingCounterNamesJson.count();
+          countersDoc[lit("counters")] = selectedCounterDescriptionsJson;
+          countersDoc[lit("missing_counters")] = missingCounterNamesJson;
+
+          QJsonObject actionsDocRoot;
+          actionsDocRoot[lit("count")] = actionDocs.count();
+          actionsDocRoot[lit("actions")] = actionDocs;
+
+          QJsonObject hotspotsDocRoot;
+          hotspotsDocRoot[lit("count")] = hotspotDocs.count();
+          hotspotsDocRoot[lit("hotspots")] = hotspotDocs;
+
+          QJsonObject messagesDocRoot;
+          messagesDocRoot[lit("count")] = performanceMessagesJson.count();
+          messagesDocRoot[lit("messages")] = performanceMessagesJson;
+
+          QString writeError;
+          if(!WriteJsonFile(QDir(outputRoot).absoluteFilePath(lit("manifest.json")), manifest,
+                            writeError) ||
+             !WriteJsonFile(QDir(outputRoot).absoluteFilePath(lit("frame_stats.json")),
+                            frameStatsJson, writeError) ||
+             !WriteJsonFile(QDir(outputRoot).absoluteFilePath(lit("counters.json")), countersDoc,
+                            writeError) ||
+             !WriteJsonFile(QDir(outputRoot).absoluteFilePath(lit("actions.json")), actionsDocRoot,
+                            writeError) ||
+             !WriteJsonFile(QDir(outputRoot).absoluteFilePath(lit("hotspots.json")),
+                            hotspotsDocRoot, writeError) ||
+             !WriteJsonFile(QDir(outputRoot).absoluteFilePath(lit("performance_messages.json")),
+                            messagesDocRoot, writeError))
+          {
+            fatalError = writeError;
+          }
+        }
+
+        progress.store(1.0f);
+        finish();
+      });
+
+  exportThread->setName(lit("Export Performance Summary"));
+  exportThread->start();
+
+  ShowProgressDialog(window, window->tr("Exporting performance summary, please wait..."),
+                     [&finished]() { return finished.load(); },
+                     [&progress]() { return progress.load(); },
+                     [&cancelRequested]() { cancelRequested.store(true); });
+
+  exportThread->wait();
+  exportThread->deleteLater();
+
+  ctx.SetEventID({}, originalSelectedEvent, originalEvent, true);
+
+  if(!fatalError.isEmpty())
+  {
+    RDDialog::critical(
+        window, window->tr("Export Performance Summary Failed"),
+        window->tr("Performance summary export failed. Partial output may exist in:\n%1\n\n%2")
+            .arg(outputRoot)
+            .arg(fatalError));
+  }
+  else if(cancelledByUser)
+  {
+    RDDialog::information(
+        window, window->tr("Export Performance Summary Cancelled"),
+        window->tr("Performance summary export was cancelled. Partial output was written to:\n%1")
+            .arg(outputRoot));
+  }
+  else
+  {
+    QString index;
+    QTextStream indexStream(&index);
+    indexStream << "# RenderDoc Performance Export\n\n";
+    indexStream << "- Capture file: `" << captureFilename << "`\n";
+    indexStream << "- Driver: `" << driverName << "`\n";
+    indexStream << "- Graphics API: `" << apiName << "`\n";
+    if(hasFrameNumber)
+      indexStream << "- Frame number: `" << frameNumber << "`\n";
+    indexStream << "- Generated at: `" << exportTimestamp << "`\n";
+    indexStream << "- Total performance-relevant actions: `" << actions.count() << "`\n";
+    indexStream << "- Filtered-out non-performance actions: `" << filteredOutActionCount
+                << "`\n";
+    indexStream << "- Captured counters: `" << selectedCounterDescriptionsJson.count() << "`\n";
+    indexStream << "- Missing requested counters: `" << missingCounterNamesJson.count() << "`\n";
+    indexStream << "- Actions with GPU duration: `" << actionsWithGpuDuration << "`\n";
+    indexStream << "- Actions with performance messages: `" << actionsWithPerformanceMessages
+                << "`\n";
+    indexStream << "- Performance messages: `" << totalPerformanceMessageCount << "`\n\n";
+
+    indexStream << "## Top GPU Hotspots\n\n";
+
+    QVector<ExportActionSummary> hotspotSummaries = actionSummaries;
+    std::sort(hotspotSummaries.begin(), hotspotSummaries.end(),
+              [](const ExportActionSummary &a, const ExportActionSummary &b) {
+                const bool aHasDuration = a.gpuDurationMs >= 0.0;
+                const bool bHasDuration = b.gpuDurationMs >= 0.0;
+
+                if(aHasDuration != bHasDuration)
+                  return aHasDuration > bHasDuration;
+
+                if(aHasDuration && a.gpuDurationMs != b.gpuDurationMs)
+                  return a.gpuDurationMs > b.gpuDurationMs;
+
+                return a.action.eventId < b.action.eventId;
+              });
+
+    int hotspotLineCount = 0;
+    for(const ExportActionSummary &summary : hotspotSummaries)
+    {
+      if(summary.gpuDurationMs < 0.0)
+        continue;
+
+      indexStream << "- `E" << summary.action.eventId << "` `" << summary.action.kind << "` "
+                  << summary.action.name << " - `" << FormatMilliseconds(summary.gpuDurationMs)
+                  << " ms`";
+
+      if(summary.performanceMessageCount > 0)
+        indexStream << " - perf messages `" << summary.performanceMessageCount << "`";
+
+      if(!summary.action.hierarchy.isEmpty())
+        indexStream << " - hierarchy `" << summary.action.hierarchy << "`";
+
+      indexStream << "\n";
+
+      hotspotLineCount++;
+      if(hotspotLineCount >= 25)
+        break;
+    }
+
+    if(hotspotLineCount == 0)
+      indexStream << "- No GPU duration data was available.\n";
+
+    indexStream << "\n## Frame-Level Performance Messages\n\n";
+
+    if(frameLevelPerformanceMessages.isEmpty())
+    {
+      indexStream << "- None\n";
+    }
+    else
+    {
+      for(const DebugMessage &message : frameLevelPerformanceMessages)
+      {
+        indexStream << "- `" << ToQStr(message.severity) << "` `" << ToQStr(message.source)
+                    << "`: " << FromRDCStr(message.description) << "\n";
+      }
+    }
+
+    QString writeError;
+    if(!WriteTextFile(QDir(outputRoot).absoluteFilePath(lit("index.md")), index, writeError))
+    {
+      RDDialog::critical(
+          window, window->tr("Export Performance Summary Failed"),
+          window->tr("Performance summary export completed, but writing `index.md` failed.\n\n%1")
+              .arg(writeError));
+      return;
+    }
+
+    RDDialog::information(
+        window, window->tr("Export Performance Summary Complete"),
+        window->tr("Performance summary export completed successfully.\n\nOutput:\n%1")
+            .arg(outputRoot));
+  }
+}
 
 NetworkWorker::NetworkWorker() : QObject(NULL)
 {
@@ -485,6 +1514,7 @@ MainWindow::MainWindow(ICaptureContext &ctx) : QMainWindow(NULL), ui(new Ui::Mai
 
   ui->action_Save_Capture_Inplace->setEnabled(false);
   ui->action_Save_Capture_As->setEnabled(false);
+  ui->action_Export_Project->setEnabled(false);
   ui->action_Close_Capture->setEnabled(false);
   ui->menu_Export_As->setEnabled(false);
 
@@ -1194,6 +2224,7 @@ void MainWindow::CloseCapture()
 
   ui->action_Save_Capture_Inplace->setEnabled(false);
   ui->action_Save_Capture_As->setEnabled(false);
+  ui->action_Export_Project->setEnabled(false);
   ui->menu_Export_As->setEnabled(false);
 }
 
@@ -2231,6 +3262,7 @@ void MainWindow::OnCaptureLoaded()
   // as any changes are made.
   ui->action_Save_Capture_Inplace->setEnabled(m_Ctx.IsCaptureTemporary());
   ui->action_Save_Capture_As->setEnabled(true);
+  ui->action_Export_Project->setEnabled(true);
   ui->action_Close_Capture->setEnabled(true);
   ui->menu_Export_As->setEnabled(true);
 
@@ -2294,6 +3326,7 @@ void MainWindow::OnCaptureClosed()
 {
   ui->action_Save_Capture_Inplace->setEnabled(false);
   ui->action_Save_Capture_As->setEnabled(false);
+  ui->action_Export_Project->setEnabled(false);
   ui->action_Close_Capture->setEnabled(false);
   ui->menu_Export_As->setEnabled(false);
 
@@ -2474,6 +3507,789 @@ void MainWindow::on_action_Save_Capture_Inplace_triggered()
 void MainWindow::on_action_Save_Capture_As_triggered()
 {
   PromptSaveCaptureAs();
+}
+
+void MainWindow::on_action_Export_Project_triggered()
+{
+  if(!m_Ctx.IsCaptureLoaded())
+    return;
+
+  if(!m_Ctx.IsCaptureLocal())
+  {
+    RDDialog::information(
+        this, tr("Save capture locally"),
+        tr("The capture is on a remote host, it must be saved locally before the performance "
+           "summary can be exported."));
+
+    if(!PromptSaveCaptureAs() || !m_Ctx.IsCaptureLocal())
+      return;
+  }
+
+  QString outputParent =
+      RDDialog::getExistingDirectory(this, tr("Choose performance export folder"),
+                                     QFileInfo(m_Ctx.GetCaptureFilename()).absolutePath());
+
+  if(outputParent.isEmpty())
+    return;
+
+  QString captureName = QFileInfo(m_Ctx.GetCaptureFilename()).completeBaseName();
+  if(captureName.isEmpty())
+    captureName = QFileInfo(m_Ctx.GetCaptureFilename()).fileName();
+  if(captureName.isEmpty())
+    captureName = lit("capture");
+
+  QString outputRoot = QDir(outputParent).absoluteFilePath(
+      SanitiseFileComponent(captureName, 40) + lit("_performance_export"));
+
+  if(QDir(outputRoot).exists())
+    outputRoot += lit("_") + QDateTime::currentDateTime().toString(lit("yyyyMMdd_HHmmss"));
+
+  ExportPerformanceSummary(this, m_Ctx, outputRoot);
+  return;
+
+#if 0
+  if(!m_Ctx.IsCaptureLoaded())
+    return;
+
+  if(!m_Ctx.IsCaptureLocal())
+  {
+    RDDialog::information(
+        this, tr("Save capture locally"),
+        tr("The capture is on a remote host, it must be saved locally before it can be exported."));
+
+    if(!PromptSaveCaptureAs() || !m_Ctx.IsCaptureLocal())
+      return;
+  }
+
+  QString outputParent =
+      RDDialog::getExistingDirectory(this, tr("Choose project export folder"),
+                                     QFileInfo(m_Ctx.GetCaptureFilename()).absolutePath());
+
+  if(outputParent.isEmpty())
+    return;
+
+  QString captureName = QFileInfo(m_Ctx.GetCaptureFilename()).completeBaseName();
+  if(captureName.isEmpty())
+    captureName = QFileInfo(m_Ctx.GetCaptureFilename()).fileName();
+  if(captureName.isEmpty())
+    captureName = lit("capture");
+
+  QString outputRoot = QDir(outputParent).absoluteFilePath(
+      SanitiseFileComponent(captureName, 40) + lit("_export_project"));
+
+  if(QDir(outputRoot).exists())
+    outputRoot += lit("_") + QDateTime::currentDateTime().toString(lit("yyyyMMdd_HHmmss"));
+
+  QString exportTimestamp = QDateTime::currentDateTime().toString(Qt::ISODate);
+  const FrameDescription &frameInfo = m_Ctx.FrameInfo();
+  uint32_t frameNumber = frameInfo.frameNumber;
+  bool hasFrameNumber = frameNumber != FrameDescription::NoFrameNumber;
+  bool containsAnnotations = frameInfo.containsAnnotations;
+  QString captureFilename = m_Ctx.GetCaptureFilename();
+  QString driverName = FromRDCStr(m_Ctx.Replay().GetCaptureAccess()->DriverName());
+  GraphicsAPI apiType = m_Ctx.APIProps().pipelineType;
+  QString apiName = ToQStr(apiType);
+
+  QMap<ResourceId, ResourceDescription> resourceDescs;
+  QMap<ResourceId, TextureDescription> textureDescs;
+  QMap<ResourceId, BufferDescription> bufferDescs;
+  QMap<ResourceId, QString> resourceNames;
+
+  for(const ResourceDescription &resource : m_Ctx.GetResources())
+  {
+    ResourceDescription copy = resource;
+    copy.annotations = NULL;
+    resourceDescs.insert(copy.resourceId, copy);
+    resourceNames.insert(copy.resourceId, m_Ctx.GetResourceName(copy.resourceId));
+  }
+
+  for(const TextureDescription &texture : m_Ctx.GetTextures())
+    textureDescs.insert(texture.resourceId, texture);
+
+  for(const BufferDescription &buffer : m_Ctx.GetBuffers())
+    bufferDescs.insert(buffer.resourceId, buffer);
+
+  QVector<ExportActionInfo> actions;
+  CollectExportActions(m_Ctx.CurRootActions(), m_Ctx.GetStructuredFile(), {}, actions);
+
+  uint32_t originalSelectedEvent = m_Ctx.CurSelectedEvent();
+  uint32_t originalEvent = m_Ctx.CurEvent();
+
+  std::atomic<bool> finished(false);
+  std::atomic<float> progress(0.0f);
+  std::atomic<bool> cancelRequested(false);
+  bool cancelledByUser = false;
+  QString fatalError;
+  QVector<ExportActionSummary> summaries;
+  int warningCount = 0;
+  int totalTextureExports = 0;
+  int totalBufferExports = 0;
+  int totalMeshExports = 0;
+  int totalReferenceExports = 0;
+
+  LambdaThread *exportThread = new LambdaThread([this, outputRoot, exportTimestamp, captureFilename,
+                                                 driverName, apiName, apiType, frameNumber,
+                                                 hasFrameNumber, containsAnnotations, actions,
+                                                 resourceDescs, textureDescs, bufferDescs,
+                                                 resourceNames, &finished, &progress,
+                                                 &cancelRequested, &cancelledByUser, &fatalError,
+                                                 &summaries, &warningCount, &totalTextureExports,
+                                                 &totalBufferExports, &totalMeshExports,
+                                                 &totalReferenceExports]() mutable {
+    auto finish = [&]() { finished.store(true); };
+    auto setProgress = [&](int completed, int total) {
+      progress.store(total > 0 ? float(completed) / float(total) : 1.0f);
+    };
+
+    int totalSteps = qMax(1, textureDescs.count() + bufferDescs.count() + actions.count());
+    int completedSteps = 0;
+
+    QDir rootDir(outputRoot);
+
+    if(!QDir().mkpath(rootDir.absolutePath()))
+    {
+      fatalError = QFormatStr("Couldn't create export directory '%1'.").arg(outputRoot);
+      finish();
+      return;
+    }
+
+    QString actionsRoot = rootDir.absoluteFilePath(lit("actions"));
+    if(!QDir().mkpath(actionsRoot))
+    {
+      fatalError = QFormatStr("Couldn't create export actions directory '%1'.").arg(actionsRoot);
+      finish();
+      return;
+    }
+
+    QMap<uint32_t, QVector<ResourceUsageRef>> usageByEvent;
+
+    m_Ctx.Replay().BlockInvoke([&](IReplayController *r) {
+      for(auto it = textureDescs.begin(); it != textureDescs.end(); ++it)
+      {
+        if(cancelRequested.load())
+        {
+          cancelledByUser = true;
+          return;
+        }
+
+        rdcarray<EventUsage> usages = r->GetUsage(it.key());
+        for(const EventUsage &usage : usages)
+        {
+          ResourceUsageRef ref;
+          ref.id = it.key();
+          ref.usage = usage.usage;
+          ref.eventId = usage.eventId;
+          usageByEvent[usage.eventId].push_back(ref);
+        }
+
+        completedSteps++;
+        setProgress(completedSteps, totalSteps);
+      }
+
+      for(auto it = bufferDescs.begin(); it != bufferDescs.end(); ++it)
+      {
+        if(cancelRequested.load())
+        {
+          cancelledByUser = true;
+          return;
+        }
+
+        rdcarray<EventUsage> usages = r->GetUsage(it.key());
+        for(const EventUsage &usage : usages)
+        {
+          ResourceUsageRef ref;
+          ref.id = it.key();
+          ref.usage = usage.usage;
+          ref.eventId = usage.eventId;
+          usageByEvent[usage.eventId].push_back(ref);
+        }
+
+        completedSteps++;
+        setProgress(completedSteps, totalSteps);
+      }
+    });
+
+    for(const ExportActionInfo &action : actions)
+    {
+      if(cancelRequested.load())
+      {
+        cancelledByUser = true;
+        break;
+      }
+
+      QString actionDirPath = QDir(actionsRoot).absoluteFilePath(action.folderName);
+      QString texturesPath = QDir(actionDirPath).absoluteFilePath(lit("textures"));
+      QString buffersPath = QDir(actionDirPath).absoluteFilePath(lit("buffers"));
+      QString meshPath = QDir(actionDirPath).absoluteFilePath(lit("mesh"));
+      QString referencesPath = QDir(actionDirPath).absoluteFilePath(lit("references"));
+
+      if(!QDir().mkpath(texturesPath) || !QDir().mkpath(buffersPath) || !QDir().mkpath(meshPath) ||
+         !QDir().mkpath(referencesPath))
+      {
+        fatalError =
+            QFormatStr("Couldn't create export subdirectories for action E%1.").arg(action.eventId);
+        break;
+      }
+
+      QDir actionDir(actionDirPath);
+      QDir texturesDir(texturesPath);
+      QDir buffersDir(buffersPath);
+      QDir meshDir(meshPath);
+
+      QMap<ResourceId, ResourceAggregate> aggregates;
+      auto addResource = [&](ResourceId id, const QString &sourceTag, const QString &usageTag,
+                             uint32_t usageEvent) {
+        if(id == ResourceId())
+          return;
+
+        ResourceAggregate &agg = aggregates[id];
+        agg.id = id;
+        agg.type = ResourceTypeForId(id, resourceDescs, textureDescs, bufferDescs);
+        agg.name = resourceNames.value(id, ResourceIdText(id));
+
+        AppendUnique(agg.sourceTags, sourceTag);
+        AppendUnique(agg.usageTags, usageTag);
+        AppendUnique(agg.usageEventIds, usageEvent);
+      };
+
+      addResource(action.copySource, lit("Action Copy Source"), QString(), 0);
+      addResource(action.copyDestination, lit("Action Copy Destination"), QString(), 0);
+      addResource(action.depthOut, lit("Action Depth Output"), QString(), 0);
+
+      for(size_t i = 0; i < action.outputs.size(); i++)
+        addResource(action.outputs[i], QFormatStr("Action Color Output %1").arg(int(i)), QString(),
+                    0);
+
+      for(uint32_t eventId : action.eventIds)
+      {
+        const QVector<ResourceUsageRef> usageRefs = usageByEvent.value(eventId);
+        for(const ResourceUsageRef &usage : usageRefs)
+        {
+          addResource(usage.id, QFormatStr("Usage at E%1").arg(usage.eventId),
+                      ToQStr(usage.usage, apiType), usage.eventId);
+        }
+      }
+
+      QJsonArray textureMetadata;
+      QJsonArray bufferMetadata;
+      QJsonArray meshMetadata;
+      QJsonArray referenceMetadata;
+      QStringList textureLines;
+      QStringList bufferLines;
+      QStringList meshLines;
+      QStringList referenceLines;
+      QStringList errorLines;
+      int localTextureCount = 0;
+      int localBufferCount = 0;
+      int localMeshCount = 0;
+      int localReferenceCount = 0;
+      int localErrorCount = 0;
+
+      m_Ctx.Replay().BlockInvoke([&](IReplayController *r) {
+        if(cancelRequested.load())
+          return;
+
+        r->SetFrameEvent(action.eventId, false);
+
+        const PipeState &pipe = r->GetPipelineState();
+
+        auto addDescriptorResources = [&](const Descriptor &descriptor, const QString &sourceTag) {
+          addResource(descriptor.resource, sourceTag, QString(), 0);
+          addResource(descriptor.secondary, sourceTag + lit(" Secondary"), QString(), 0);
+          addResource(descriptor.view, sourceTag + lit(" View"), QString(), 0);
+        };
+
+        auto addUsedDescriptors = [&](const rdcarray<UsedDescriptor> &usedDescriptors,
+                                      const QString &stageName, const QString &label) {
+          for(const UsedDescriptor &used : usedDescriptors)
+          {
+            QString sourceTag = QFormatStr("%1 %2").arg(stageName).arg(label);
+            addDescriptorResources(used.descriptor, sourceTag);
+            addResource(used.sampler.object, sourceTag + lit(" Sampler"), QString(), 0);
+            addResource(used.sampler.ycbcrSampler, sourceTag + lit(" YCbCr Conversion"),
+                        QString(), 0);
+          }
+        };
+
+        addResource(pipe.GetGraphicsPipelineObject(), lit("Graphics Pipeline"), QString(), 0);
+        addResource(pipe.GetComputePipelineObject(), lit("Compute Pipeline"), QString(), 0);
+
+        for(ShaderStage stage :
+            {ShaderStage::Vertex, ShaderStage::Hull, ShaderStage::Domain, ShaderStage::Geometry,
+             ShaderStage::Pixel, ShaderStage::Compute, ShaderStage::Task, ShaderStage::Mesh})
+        {
+          QString stageName = ToQStr(stage, apiType);
+          addResource(pipe.GetShader(stage), QFormatStr("%1 Shader").arg(stageName), QString(), 0);
+          addUsedDescriptors(pipe.GetConstantBlocks(stage, true), stageName,
+                             lit("Constant Buffer"));
+          addUsedDescriptors(pipe.GetReadOnlyResources(stage, true), stageName,
+                             lit("ReadOnly Resource"));
+          addUsedDescriptors(pipe.GetReadWriteResources(stage, true), stageName,
+                             lit("ReadWrite Resource"));
+          addUsedDescriptors(pipe.GetSamplers(stage, true), stageName, lit("Sampler"));
+        }
+
+        addDescriptorResources(pipe.GetDepthTarget(), lit("Depth Target"));
+        addDescriptorResources(pipe.GetDepthResolveTarget(), lit("Depth Resolve Target"));
+
+        rdcarray<Descriptor> outputTargets = pipe.GetOutputTargets();
+        for(int i = 0; i < outputTargets.count(); i++)
+          addDescriptorResources(outputTargets[i], QFormatStr("Color Output %1").arg(i));
+
+        auto exportMeshStage = [&](MeshDataStage stage) {
+          MeshFormat mesh = r->GetPostVSData(0, 0, stage);
+          QString stageStem = MeshStageFileStem(stage);
+          QString stageTitle = ToQStr(stage);
+
+          if(mesh.vertexResourceId == ResourceId() && mesh.indexResourceId == ResourceId() &&
+             mesh.numIndices == 0 && FromRDCStr(mesh.status).trimmed().isEmpty())
+            return;
+
+          addResource(mesh.vertexResourceId, stageTitle + lit(" Vertex Buffer"), QString(), 0);
+          addResource(mesh.indexResourceId, stageTitle + lit(" Index Buffer"), QString(), 0);
+
+          QJsonObject meshObj;
+          meshObj[lit("stage")] = stageTitle;
+          meshObj[lit("stage_key")] = stageStem;
+          meshObj[lit("status")] = FromRDCStr(mesh.status);
+          meshObj[lit("topology")] = ToQStr(mesh.topology);
+          meshObj[lit("num_indices")] = int(mesh.numIndices);
+          meshObj[lit("base_vertex")] = action.baseVertex;
+          meshObj[lit("vertex_resource_id")] = ResourceIdText(mesh.vertexResourceId);
+          meshObj[lit("vertex_resource_name")] =
+              resourceNames.value(mesh.vertexResourceId, ResourceIdText(mesh.vertexResourceId));
+          meshObj[lit("vertex_byte_offset")] = ToJsonU64(mesh.vertexByteOffset);
+          meshObj[lit("vertex_byte_size")] = ToJsonU64(mesh.vertexByteSize);
+          meshObj[lit("vertex_byte_stride")] = int(mesh.vertexByteStride);
+          meshObj[lit("index_resource_id")] = ResourceIdText(mesh.indexResourceId);
+          meshObj[lit("index_resource_name")] =
+              resourceNames.value(mesh.indexResourceId, ResourceIdText(mesh.indexResourceId));
+          meshObj[lit("index_byte_offset")] = ToJsonU64(mesh.indexByteOffset);
+          meshObj[lit("index_byte_size")] = ToJsonU64(mesh.indexByteSize);
+          meshObj[lit("index_byte_stride")] = int(mesh.indexByteStride);
+          meshObj[lit("dispatch_size")] = ToJsonArray(mesh.dispatchSize);
+          meshObj[lit("meshlet_offset")] = int(mesh.meshletOffset);
+          meshObj[lit("meshlet_index_offset")] = int(mesh.meshletIndexOffset);
+
+          QString vertexFile;
+          QString indexFile;
+
+          if(mesh.vertexResourceId != ResourceId())
+          {
+            vertexFile = stageStem + lit("_vertices.bin");
+            QString vertexError;
+            if(WriteBufferRangeToFile(r, mesh.vertexResourceId, mesh.vertexByteOffset,
+                                      mesh.vertexByteSize, meshDir.absoluteFilePath(vertexFile),
+                                      vertexError))
+            {
+              meshObj[lit("vertex_file")] = ToPosixPath(lit("mesh/") + vertexFile);
+            }
+            else
+            {
+              meshObj[lit("vertex_error")] = vertexError;
+              errorLines.push_back(
+                  QFormatStr("- Mesh %1 vertex export failed: %2").arg(stageTitle).arg(
+                      vertexError));
+              localErrorCount++;
+              warningCount++;
+            }
+          }
+
+          if(mesh.indexResourceId != ResourceId() && mesh.indexByteStride > 0 && mesh.numIndices > 0)
+          {
+            uint64_t indexSize = mesh.indexByteSize;
+            if(indexSize == 0)
+              indexSize = uint64_t(mesh.numIndices) * uint64_t(mesh.indexByteStride);
+
+            indexFile = stageStem + lit("_indices.bin");
+            QString indexError;
+            if(WriteBufferRangeToFile(r, mesh.indexResourceId, mesh.indexByteOffset, indexSize,
+                                      meshDir.absoluteFilePath(indexFile), indexError))
+            {
+              meshObj[lit("index_file")] = ToPosixPath(lit("mesh/") + indexFile);
+            }
+            else
+            {
+              meshObj[lit("index_error")] = indexError;
+              errorLines.push_back(
+                  QFormatStr("- Mesh %1 index export failed: %2").arg(stageTitle).arg(indexError));
+              localErrorCount++;
+              warningCount++;
+            }
+          }
+
+          meshMetadata.append(meshObj);
+          localMeshCount++;
+
+          QString meshSummary = QFormatStr("- `%1`: topology `%2`, vertices `%3`, indices `%4`")
+                                    .arg(stageTitle)
+                                    .arg(meshObj[lit("topology")].toString())
+                                    .arg(vertexFile.isEmpty() ? lit("-") : vertexFile)
+                                    .arg(indexFile.isEmpty() ? lit("-") : indexFile);
+
+          if(!FromRDCStr(mesh.status).trimmed().isEmpty())
+            meshSummary += QFormatStr(" (status: %1)").arg(FromRDCStr(mesh.status));
+
+          meshLines.push_back(meshSummary);
+        };
+
+        if(action.flags & ActionFlags::Drawcall)
+        {
+          exportMeshStage(MeshDataStage::VSOut);
+          exportMeshStage(MeshDataStage::GSOut);
+        }
+
+        if(action.flags & ActionFlags::MeshDispatch)
+        {
+          exportMeshStage(MeshDataStage::TaskOut);
+          exportMeshStage(MeshDataStage::MeshOut);
+        }
+
+        for(auto it = aggregates.begin(); it != aggregates.end(); ++it)
+        {
+          if(cancelRequested.load())
+            return;
+
+          const ResourceAggregate &agg = it.value();
+          QJsonObject obj = MakeCommonResourceJson(agg, textureDescs, bufferDescs);
+
+          auto texIt = textureDescs.find(agg.id);
+          if(texIt != textureDescs.end())
+          {
+            QString fileName = MakeResourceStem(lit("texture"), agg.id, agg.name) + lit(".dds");
+            QString filePath = texturesDir.absoluteFilePath(fileName);
+
+            TextureSave save;
+            save.resourceId = agg.id;
+            save.typeCast = CompType::Typeless;
+            save.destType = FileType::DDS;
+            save.mip = -1;
+            save.alpha = AlphaMapping::Preserve;
+
+            ResultDetails result = r->SaveTexture(save, filePath);
+            if(result.OK())
+            {
+              obj[lit("output_file")] = ToPosixPath(lit("textures/") + fileName);
+              textureLines.push_back(QFormatStr("- `%1`: %2 (%3)")
+                                         .arg(fileName)
+                                         .arg(agg.name)
+                                         .arg(agg.sourceTags.isEmpty()
+                                                  ? lit("no source tags")
+                                                  : agg.sourceTags.join(lit(", "))));
+            }
+            else
+            {
+              obj[lit("error")] = FromRDCStr(result.Message());
+              errorLines.push_back(QFormatStr("- Texture %1 export failed: %2").arg(agg.name).arg(
+                  FromRDCStr(result.Message())));
+              localErrorCount++;
+              warningCount++;
+            }
+
+            textureMetadata.append(obj);
+            localTextureCount++;
+            continue;
+          }
+
+          auto bufferIt = bufferDescs.find(agg.id);
+          if(bufferIt != bufferDescs.end())
+          {
+            QString fileName = MakeResourceStem(lit("buffer"), agg.id, agg.name) + lit(".bin");
+            QString filePath = buffersDir.absoluteFilePath(fileName);
+            QString bufferError;
+
+            if(WriteBufferRangeToFile(r, agg.id, 0, bufferIt.value().length, filePath,
+                                      bufferError))
+            {
+              obj[lit("output_file")] = ToPosixPath(lit("buffers/") + fileName);
+              bufferLines.push_back(QFormatStr("- `%1`: %2 (%3 bytes)")
+                                        .arg(fileName)
+                                        .arg(agg.name)
+                                        .arg(QString::number(bufferIt.value().length)));
+            }
+            else
+            {
+              obj[lit("error")] = bufferError;
+              errorLines.push_back(
+                  QFormatStr("- Buffer %1 export failed: %2").arg(agg.name).arg(bufferError));
+              localErrorCount++;
+              warningCount++;
+            }
+
+            bufferMetadata.append(obj);
+            localBufferCount++;
+            continue;
+          }
+
+          referenceMetadata.append(obj);
+          localReferenceCount++;
+          referenceLines.push_back(QFormatStr("- `%1` (%2)")
+                                       .arg(agg.name)
+                                       .arg(agg.sourceTags.isEmpty() ? lit("metadata only")
+                                                                     : agg.sourceTags.join(lit(", "))));
+        }
+      });
+
+      if(cancelRequested.load())
+      {
+        cancelledByUser = true;
+        break;
+      }
+
+      QJsonObject texturesDoc;
+      texturesDoc[lit("count")] = localTextureCount;
+      texturesDoc[lit("textures")] = textureMetadata;
+
+      QJsonObject buffersDoc;
+      buffersDoc[lit("count")] = localBufferCount;
+      buffersDoc[lit("buffers")] = bufferMetadata;
+
+      QJsonObject meshDoc;
+      meshDoc[lit("count")] = localMeshCount;
+      meshDoc[lit("mesh_exports")] = meshMetadata;
+
+      QJsonObject referencesDoc;
+      referencesDoc[lit("count")] = localReferenceCount;
+      referencesDoc[lit("references")] = referenceMetadata;
+
+      QString writeError;
+      if(!WriteJsonFile(actionDir.absoluteFilePath(lit("textures/metadata.json")), texturesDoc,
+                        writeError) ||
+         !WriteJsonFile(actionDir.absoluteFilePath(lit("buffers/metadata.json")), buffersDoc,
+                        writeError) ||
+         !WriteJsonFile(actionDir.absoluteFilePath(lit("mesh/metadata.json")), meshDoc, writeError) ||
+         !WriteJsonFile(actionDir.absoluteFilePath(lit("references/metadata.json")), referencesDoc,
+                        writeError))
+      {
+        fatalError = writeError;
+        break;
+      }
+
+      QJsonObject actionDoc;
+      actionDoc[lit("action_id")] = int(action.actionId);
+      actionDoc[lit("event_id")] = int(action.eventId);
+      actionDoc[lit("name")] = action.name;
+      actionDoc[lit("hierarchy")] = action.hierarchy;
+      actionDoc[lit("kind")] = action.kind;
+      actionDoc[lit("flags")] = action.flagsText;
+      actionDoc[lit("is_fake_marker")] = action.fakeMarker;
+      actionDoc[lit("event_ids")] = ToJsonArray(action.eventIds);
+      actionDoc[lit("num_indices")] = int(action.numIndices);
+      actionDoc[lit("num_instances")] = int(action.numInstances);
+      actionDoc[lit("base_vertex")] = action.baseVertex;
+      actionDoc[lit("index_offset")] = int(action.indexOffset);
+      actionDoc[lit("vertex_offset")] = int(action.vertexOffset);
+      actionDoc[lit("instance_offset")] = int(action.instanceOffset);
+      actionDoc[lit("draw_index")] = int(action.drawIndex);
+      actionDoc[lit("dispatch_dimension")] = ToJsonArray(action.dispatchDimension);
+      actionDoc[lit("dispatch_threads_dimension")] = ToJsonArray(action.dispatchThreadsDimension);
+      actionDoc[lit("dispatch_base")] = ToJsonArray(action.dispatchBase);
+      actionDoc[lit("copy_source")] = ResourceIdText(action.copySource);
+      actionDoc[lit("copy_destination")] = ResourceIdText(action.copyDestination);
+      actionDoc[lit("depth_output")] = ResourceIdText(action.depthOut);
+      actionDoc[lit("color_outputs")] = ToJsonArray(action.outputs);
+      actionDoc[lit("textures_metadata")] = lit("textures/metadata.json");
+      actionDoc[lit("buffers_metadata")] = lit("buffers/metadata.json");
+      actionDoc[lit("mesh_metadata")] = lit("mesh/metadata.json");
+      actionDoc[lit("references_metadata")] = lit("references/metadata.json");
+      actionDoc[lit("error_count")] = localErrorCount;
+
+      if(!WriteJsonFile(actionDir.absoluteFilePath(lit("action.json")), actionDoc, writeError))
+      {
+        fatalError = writeError;
+        break;
+      }
+
+      QString readme;
+      QTextStream ts(&readme);
+      ts << "# " << action.name << "\n\n";
+      ts << "- Action ID: `" << action.actionId << "`\n";
+      ts << "- Event ID: `" << action.eventId << "`\n";
+      ts << "- Type: `" << action.kind << "`\n";
+      ts << "- Flags: `" << action.flagsText << "`\n";
+      ts << "- Hierarchy: `" << (action.hierarchy.isEmpty() ? lit("<root>") : action.hierarchy)
+         << "`\n";
+      ts << "- Event IDs: `" << JoinUInts(action.eventIds) << "`\n";
+      ts << "- Copy source: `" << ResourceIdText(action.copySource) << "`\n";
+      ts << "- Copy destination: `" << ResourceIdText(action.copyDestination) << "`\n";
+      ts << "- Depth output: `" << ResourceIdText(action.depthOut) << "`\n";
+      ts << "- Texture exports: `" << localTextureCount << "`\n";
+      ts << "- Buffer exports: `" << localBufferCount << "`\n";
+      ts << "- Mesh exports: `" << localMeshCount << "`\n";
+      ts << "- Metadata-only references: `" << localReferenceCount << "`\n";
+      ts << "- Warnings: `" << localErrorCount << "`\n\n";
+      ts << "Metadata files:\n\n";
+      ts << "- `action.json`\n";
+      ts << "- `textures/metadata.json`\n";
+      ts << "- `buffers/metadata.json`\n";
+      ts << "- `mesh/metadata.json`\n";
+      ts << "- `references/metadata.json`\n\n";
+
+      AppendMarkdownSection(ts, lit("Textures"), textureLines);
+      AppendMarkdownSection(ts, lit("Buffers"), bufferLines);
+      AppendMarkdownSection(ts, lit("Mesh Exports"), meshLines);
+      AppendMarkdownSection(ts, lit("Other References"), referenceLines);
+      AppendMarkdownSection(ts, lit("Warnings"), errorLines);
+
+      if(!WriteTextFile(actionDir.absoluteFilePath(lit("README.md")), readme, writeError))
+      {
+        fatalError = writeError;
+        break;
+      }
+
+      ExportActionSummary summary;
+      summary.action = action;
+      summary.relativeReadmePath =
+          ToPosixPath(QDir(outputRoot).relativeFilePath(actionDir.absoluteFilePath(lit("README.md"))));
+      summary.textureCount = localTextureCount;
+      summary.bufferCount = localBufferCount;
+      summary.meshCount = localMeshCount;
+      summary.referenceCount = localReferenceCount;
+      summary.errorCount = localErrorCount;
+      summaries.push_back(summary);
+
+      totalTextureExports += localTextureCount;
+      totalBufferExports += localBufferCount;
+      totalMeshExports += localMeshCount;
+      totalReferenceExports += localReferenceCount;
+
+      completedSteps++;
+      setProgress(completedSteps, totalSteps);
+    }
+
+    if(fatalError.isEmpty())
+    {
+      QJsonObject manifest;
+      manifest[lit("capture_file")] = captureFilename;
+      manifest[lit("driver")] = driverName;
+      manifest[lit("graphics_api")] = apiName;
+      manifest[lit("generated_at")] = exportTimestamp;
+      manifest[lit("status")] = cancelledByUser ? lit("cancelled") : lit("completed");
+      if(hasFrameNumber)
+        manifest[lit("frame_number")] = int(frameNumber);
+      manifest[lit("contains_annotations")] = containsAnnotations;
+      manifest[lit("action_count")] = int(summaries.count());
+      manifest[lit("texture_export_count")] = totalTextureExports;
+      manifest[lit("buffer_export_count")] = totalBufferExports;
+      manifest[lit("mesh_export_count")] = totalMeshExports;
+      manifest[lit("reference_count")] = totalReferenceExports;
+      manifest[lit("warning_count")] = warningCount;
+
+      QJsonArray actionsJson;
+      for(const ExportActionSummary &summary : summaries)
+      {
+        QJsonObject obj;
+        obj[lit("action_id")] = int(summary.action.actionId);
+        obj[lit("event_id")] = int(summary.action.eventId);
+        obj[lit("name")] = summary.action.name;
+        obj[lit("kind")] = summary.action.kind;
+        obj[lit("readme")] = summary.relativeReadmePath;
+        obj[lit("texture_count")] = summary.textureCount;
+        obj[lit("buffer_count")] = summary.bufferCount;
+        obj[lit("mesh_count")] = summary.meshCount;
+        obj[lit("reference_count")] = summary.referenceCount;
+        obj[lit("warning_count")] = summary.errorCount;
+        actionsJson.append(obj);
+      }
+
+      manifest[lit("actions")] = actionsJson;
+
+      QString writeError;
+      if(!WriteJsonFile(QDir(outputRoot).absoluteFilePath(lit("manifest.json")), manifest,
+                        writeError))
+      {
+        fatalError = writeError;
+      }
+      else
+      {
+        QString index;
+        QTextStream indexStream(&index);
+        indexStream << "# RenderDoc Export Project\n\n";
+        indexStream << "- Capture file: `" << captureFilename << "`\n";
+        indexStream << "- Driver: `" << driverName << "`\n";
+        indexStream << "- Graphics API: `" << apiName << "`\n";
+        if(hasFrameNumber)
+          indexStream << "- Frame number: `" << frameNumber << "`\n";
+        indexStream << "- Generated at: `" << exportTimestamp << "`\n";
+        indexStream << "- Status: `" << (cancelledByUser ? lit("cancelled") : lit("completed"))
+                    << "`\n";
+        indexStream << "- Exported actions: `" << summaries.count() << "`\n";
+        indexStream << "- Texture exports: `" << totalTextureExports << "`\n";
+        indexStream << "- Buffer exports: `" << totalBufferExports << "`\n";
+        indexStream << "- Mesh exports: `" << totalMeshExports << "`\n";
+        indexStream << "- Metadata-only references: `" << totalReferenceExports << "`\n";
+        indexStream << "- Warnings: `" << warningCount << "`\n\n";
+        indexStream << "## Actions\n\n";
+
+        if(summaries.isEmpty())
+        {
+          indexStream << "- No actions were exported.\n";
+        }
+        else
+        {
+          for(const ExportActionSummary &summary : summaries)
+          {
+            indexStream << "- [`" << summary.relativeReadmePath << "`]("
+                        << summary.relativeReadmePath << ")"
+                        << " - E" << summary.action.eventId << " - " << summary.action.name
+                        << " - textures `" << summary.textureCount << "`, buffers `"
+                        << summary.bufferCount << "`, mesh `" << summary.meshCount << "`, refs `"
+                        << summary.referenceCount << "`, warnings `" << summary.errorCount
+                        << "`\n";
+          }
+        }
+
+        if(!WriteTextFile(QDir(outputRoot).absoluteFilePath(lit("index.md")), index, writeError))
+          fatalError = writeError;
+      }
+    }
+
+    progress.store(1.0f);
+    finish();
+  });
+
+  exportThread->setName(lit("Export Project"));
+  exportThread->start();
+
+  ShowProgressDialog(this, tr("Exporting project, please wait..."),
+                     [&finished]() { return finished.load(); },
+                     [&progress]() { return progress.load(); },
+                     [&cancelRequested]() { cancelRequested.store(true); });
+
+  exportThread->wait();
+  exportThread->deleteLater();
+
+  m_Ctx.SetEventID({}, originalSelectedEvent, originalEvent, true);
+
+  if(!fatalError.isEmpty())
+  {
+    RDDialog::critical(
+        this, tr("Export Project Failed"),
+        tr("Project export failed. Partial output may exist in:\n%1\n\n%2")
+            .arg(outputRoot)
+            .arg(fatalError));
+  }
+  else if(cancelledByUser)
+  {
+    RDDialog::information(this, tr("Export Project Cancelled"),
+                          tr("Project export was cancelled. Partial output was written to:\n%1")
+                              .arg(outputRoot));
+  }
+  else if(warningCount > 0)
+  {
+    RDDialog::information(
+        this, tr("Export Project Complete"),
+        tr("Project export completed with %1 warnings.\n\nOutput:\n%2")
+            .arg(warningCount)
+            .arg(outputRoot));
+  }
+  else
+  {
+    RDDialog::information(this, tr("Export Project Complete"),
+                          tr("Project export completed successfully.\n\nOutput:\n%1")
+                              .arg(outputRoot));
+  }
+#endif
 }
 
 void MainWindow::on_action_About_triggered()
